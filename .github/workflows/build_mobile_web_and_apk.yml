@@ -1,0 +1,117 @@
+name: Build Mobile Web PWA & Android APK
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "mobile-build-and-pages"
+  cancel-in-progress: true
+
+jobs:
+  build-mobile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Unpack source bundle if uploaded via Web UI
+        shell: bash
+        run: |
+          if [ -f embervale_v7_src.tar.gz ] && [ ! -f game/project.godot ]; then
+            tar -xzf embervale_v7_src.tar.gz
+          fi
+
+      - name: Set up Java 17 for Android APK signing
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Godot 4.6.1 & Export Templates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/godot ~/.local/share/godot/export_templates/4.6.1.stable ~/.config/godot
+          curl -fsSL -o /tmp/godot/godot.zip https://github.com/godotengine/godot/releases/download/4.6.1-stable/Godot_v4.6.1-stable_linux.x86_64.zip
+          unzip -q /tmp/godot/godot.zip -d /tmp/godot
+          chmod +x /tmp/godot/Godot_v4.6.1-stable_linux.x86_64
+          curl -fsSL -o /tmp/godot/templates.tpz https://github.com/godotengine/godot/releases/download/4.6.1-stable/Godot_v4.6.1-stable_export_templates.tpz
+          unzip -q /tmp/godot/templates.tpz -d /tmp/godot/tpl
+          mv /tmp/godot/tpl/templates/* ~/.local/share/godot/export_templates/4.6.1.stable/
+
+      - name: Configure Android Keystore & Import Assets + Run 45-Test QA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.android build/web build/android
+          rm -f ~/.android/debug.keystore
+          keytool -genkeypair -v -keystore ~/.android/debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=US"
+          python3 tools/enhance_mobile_web_shell.py --self-test
+          /tmp/godot/Godot_v4.6.1-stable_linux.x86_64 --headless --path game --import
+          /tmp/godot/Godot_v4.6.1-stable_linux.x86_64 --headless --path game res://scenes/headless_test_runner.tscn
+
+      - name: Export Signed Android APK
+        shell: bash
+        env:
+          GODOT_ANDROID_KEYSTORE_DEBUG_PATH: /home/runner/.android/debug.keystore
+          GODOT_ANDROID_KEYSTORE_DEBUG_USER: androiddebugkey
+          GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD: android
+        run: |
+          set -euo pipefail
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          cat > ~/.config/godot/editor_settings-4.6.tres <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "${SDK_DIR}"
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          export/android/debug_keystore = "$HOME/.android/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          EOF
+          /tmp/godot/Godot_v4.6.1-stable_linux.x86_64 --headless --path game --export-debug "Android" ../build/android/EchoesOfEmbervale_v7_Mobile.apk
+          ls -lh build/android/EchoesOfEmbervale_v7_Mobile.apk
+
+      - name: Export Mobile Web (HTML5 / PWA) & Bundle Same-Origin APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          /tmp/godot/Godot_v4.6.1-stable_linux.x86_64 --headless --path game --export-release "Web" ../build/web/index.html
+          python3 tools/enhance_mobile_web_shell.py build/web/index.html
+          cp build/android/EchoesOfEmbervale_v7_Mobile.apk build/web/EchoesOfEmbervale_v7_Mobile.apk
+          touch build/web/.nojekyll
+
+      - name: Upload GitHub Pages Artifact (Mobile Web PWA + Direct APK)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/web
+
+      - name: Publish Android APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v7.0-mobile
+          name: "《星露物语：回响山谷》v7.0 手机横竖双模终极成品版 (Android APK + Web PWA)"
+          body: |
+            ### 《星露物语：回响山谷》v7.0 手机端全形态最终成品
+            - iOS / Android / 微信免安装即玩: https://xjiaming644-del.github.io/echoes-of-embervale-mobile/
+            - 安卓原生签名安装包: 下载下方 EchoesOfEmbervale_v7_Mobile.apk
+          files: |
+            build/android/EchoesOfEmbervale_v7_Mobile.apk
+
+  deploy-pages:
+    needs: build-mobile
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Mobile Web PWA to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
